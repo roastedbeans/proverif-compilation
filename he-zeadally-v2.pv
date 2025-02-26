@@ -1,0 +1,341 @@
+set traceDisplay = long.
+
+(* Types *)
+type pkey.      (* Public key *)
+type skey.      (* Private key *)
+type timestamp.
+type hmac.
+type id.
+type key.
+type nonce.
+(* Using built-in bitstring type, no need to declare it *)
+
+(* Channels *)
+free c: channel.              (* Public channel for network communication *)
+free regCh: channel [private]. (* Private channel for registration *)
+
+(* Constants - participant identities *)
+free IDU: id [private].       (* User identity *)
+free IDC: id [private].       (* Controller identity *)
+
+(* Private keys for participants - kept private *)
+free QA: skey [private].      (* AAL server private key *)
+free QU: skey [private].      (* User's private key *)
+free QC: skey [private].      (* Controller's private key *)
+
+(* Debug variables *)
+free SK_test: bitstring [private].
+
+(* Type conversion - uniform bitstring handling *)
+fun id2bits(id): bitstring [data, typeConverter].
+fun bits2id(bitstring): id [data, typeConverter].
+fun timestamp2bits(timestamp): bitstring [data, typeConverter].
+fun bits2timestamp(bitstring): timestamp [data, typeConverter].
+fun pkey2bits(pkey): bitstring [data, typeConverter].
+fun bits2pkey(bitstring): pkey [data, typeConverter].
+fun hmac2bits(hmac): bitstring [data, typeConverter].
+fun bits2hmac(bitstring): hmac [data, typeConverter].
+fun nonce2bits(nonce): bitstring [data, typeConverter].
+fun bits2nonce(bitstring): nonce [data, typeConverter].
+fun key2bits(key): bitstring [data, typeConverter].
+fun bits2key(bitstring): key [data, typeConverter].
+
+(* Cryptographic operations *)
+(* Elliptic curve operations *)
+fun pk(skey): pkey.           (* Public key from private key *)
+fun ecMult(skey, pkey): key.  (* ECC scalar multiplication *)
+fun h(bitstring): bitstring.  (* Hash function *)
+fun hmacfn(key, bitstring): hmac. (* HMAC function *)
+
+(* Symmetric encryption *)
+fun senc(bitstring, key): bitstring.
+reduc forall m: bitstring, k: key; sdec(senc(m, k), k) = m.
+
+(* For session key derivation - models H(QU * PC) = H(QC * PU) *)
+equation forall x: skey, y: skey; 
+  h(key2bits(ecMult(x, pk(y)))) = h(key2bits(ecMult(y, pk(x)))).
+
+(* Events to track protocol execution *)
+event UserStarted(id, id, pkey).
+event UserSendsRequest(id, id, pkey, timestamp).
+event AALReceived1(id, id, pkey, bitstring).
+event AALSendsRequest(id, id, pkey, timestamp).
+event ControllerReceived(id, id, pkey, bitstring).  (* Fourth parameter is bitstring, not timestamp *)
+event ControllerSendsResponse(id, id, pkey, timestamp).
+event AALReceived2(id, id, pkey, bitstring).
+event AALSendsResponse(id, id, pkey, timestamp).
+event UserReceived(id, id, pkey, bitstring).
+event UserAuthenticated(id, id).
+event AALAuthenticated(id, id).
+event ControllerAuthenticated(id, id).
+event SessionKeyEstablished(id, id, key).
+
+(* Failure events *)
+event HMACVerificationFailed().
+event TimestampCheckFailed().
+event IDVerificationFailed().
+
+(* Security queries *)
+query attacker(QA).
+query attacker(QU).
+query attacker(QC).
+query attacker(IDU).
+query attacker(IDC).
+query attacker(SK_test).
+
+(* Protocol correctness queries *)
+query id1: id, id2: id, pk: pkey, ts: timestamp; 
+  inj-event(AALReceived1(id1, id2, pk, timestamp2bits(ts))) ==> 
+  inj-event(UserSendsRequest(id1, id2, pk, ts)).
+
+query id1: id, id2: id;
+  inj-event(UserAuthenticated(id1, id2)) ==> 
+  inj-event(ControllerAuthenticated(id1, id2)).
+
+query id1: id, id2: id, k: key;
+  inj-event(SessionKeyEstablished(id1, id2, k)) ==> 
+  (inj-event(UserAuthenticated(id1, id2)) && inj-event(ControllerAuthenticated(id1, id2))).
+
+(* Timestamp freshness check helper function *)
+letfun isFresh(ts1: timestamp, ts2: timestamp) = true.
+
+(* User process *)
+let User(IDU: id, IDC: id, QU: skey, KA_U: key, PA: pkey) =
+  event UserStarted(IDU, IDC, pk(QU));
+  
+  (* Generate ephemeral key pair *)
+  new qU: skey;
+  let PU = pk(qU) in
+  
+  (* Generate timestamp *)
+  new TSU: timestamp;
+  
+  (* Calculate temporary key with AAL *)
+  let TKA_U = ecMult(qU, PA) in
+  
+  (* Construct message *)
+  let m1 = (id2bits(IDU), id2bits(IDC), pkey2bits(PU), timestamp2bits(TSU)) in
+  let mac = hmacfn(KA_U, m1) in
+  let encrypted_m1 = senc((m1, hmac2bits(mac)), TKA_U) in
+  
+  (* Send login request *)
+  event UserSendsRequest(IDU, IDC, PU, TSU);
+  out(c, (encrypted_m1, pkey2bits(PU)));
+  
+  (* Receive login response *)
+  in(c, (encrypted_m4: bitstring, TSA2: timestamp));
+  
+  (* Verify timestamp freshness *)
+  new currentTime: timestamp;
+  if isFresh(TSA2, currentTime) then
+  (
+    (* Decrypt response *)
+    let (IDU_bits: bitstring, IDC_bits: bitstring, PC_bits: bitstring, TSA2_bits: bitstring) = 
+        sdec(encrypted_m4, TKA_U) in
+        
+    let IDU_recv = bits2id(IDU_bits) in
+    let IDC_recv = bits2id(IDC_bits) in
+    let PC = bits2pkey(PC_bits) in
+    
+    event UserReceived(IDU_recv, IDC_recv, PC, timestamp2bits(TSA2));
+    
+    (* Verify IDs *)
+    if IDU_recv = IDU && IDC_recv = IDC then
+    (
+      (* Calculate session key *)
+      let SKC_U = bits2key(h(key2bits(ecMult(qU, PC)))) in
+      
+      (* Mark successful authentication *)
+      event UserAuthenticated(IDU, IDC);
+      event SessionKeyEstablished(IDU, IDC, SKC_U);
+      
+      (* Use session key *)
+      out(c, senc(SK_test, SKC_U))
+    )
+    else
+    (
+      event IDVerificationFailed()
+    )
+  )
+  else
+  (
+    event TimestampCheckFailed()
+  ).
+
+(* AAL Server process *)
+let AALServer(IDU: id, IDC: id, QA: skey, KA_U: key, KA_C: key) =
+  let PA = pk(QA) in
+  
+  (* Receive login request *)
+  in(c, (encrypted_m1: bitstring, PU_bits: bitstring));
+  let PU = bits2pkey(PU_bits) in
+  
+  (* Calculate temporary key with user *)
+  let TKA_U = ecMult(QA, PU) in
+  
+  (* Decrypt and verify message *)
+  let ((IDU_bits: bitstring, IDC_bits: bitstring, PU_bits2: bitstring, TSU_bits: bitstring), mac_recv: bitstring) = 
+      sdec(encrypted_m1, TKA_U) in
+  
+  let IDU_recv = bits2id(IDU_bits) in
+  let IDC_recv = bits2id(IDC_bits) in
+  let TSU = bits2timestamp(TSU_bits) in
+  
+  (* Verify timestamp freshness *)
+  new currentTime: timestamp;
+  if isFresh(TSU, currentTime) then
+  (
+    (* Verify HMAC *)
+    let expected_mac = hmacfn(KA_U, (IDU_bits, IDC_bits, PU_bits2, TSU_bits)) in
+    
+    if hmac2bits(expected_mac) = mac_recv then
+    (
+      event AALReceived1(IDU_recv, IDC_recv, PU, timestamp2bits(TSU));
+      
+      (* Verify IDs *)
+      if IDU_recv = IDU && IDC_recv = IDC then
+      (
+        (* Generate timestamp *)
+        new TSA1: timestamp;
+        
+        (* Construct authentication data request *)
+        let m2 = (id2bits(IDU), id2bits(IDC), PU_bits, timestamp2bits(TSA1)) in
+        let encrypted_m2 = senc(m2, KA_C) in
+        
+        (* Send to controller *)
+        event AALSendsRequest(IDU, IDC, PU, TSA1);
+        out(c, (encrypted_m2, TSA1));
+        
+        (* Receive authentication data response *)
+        in(c, (encrypted_m3: bitstring, TSC: timestamp));
+        
+        (* Verify timestamp freshness *)
+        new currentTime2: timestamp;
+        if isFresh(TSC, currentTime2) then
+        (
+          (* Decrypt and verify *)
+          let (IDU_bits2: bitstring, IDC_bits2: bitstring, PC_bits: bitstring, TSC_bits: bitstring) = 
+              sdec(encrypted_m3, KA_C) in
+          
+          let IDU_recv2 = bits2id(IDU_bits2) in
+          let IDC_recv2 = bits2id(IDC_bits2) in
+          let PC = bits2pkey(PC_bits) in
+          
+          event AALReceived2(IDU_recv2, IDC_recv2, PC, timestamp2bits(TSC));
+          
+          if IDU_recv2 = IDU && IDC_recv2 = IDC then
+          (
+            (* Generate timestamp *)
+            new TSA2: timestamp;
+            
+            (* Construct login response *)
+            let m4 = (id2bits(IDU), id2bits(IDC), PC_bits, timestamp2bits(TSA2)) in
+            let encrypted_m4 = senc(m4, TKA_U) in
+            
+            (* Send to user *)
+            event AALSendsResponse(IDU, IDC, PC, TSA2);
+            out(c, (encrypted_m4, TSA2));
+            
+            event AALAuthenticated(IDU, IDC)
+          )
+          else
+          (
+            event IDVerificationFailed()
+          )
+        )
+        else
+        (
+          event TimestampCheckFailed()
+        )
+      )
+      else
+      (
+        event IDVerificationFailed()
+      )
+    )
+    else
+    (
+      event HMACVerificationFailed()
+    )
+  )
+  else
+  (
+    event TimestampCheckFailed()
+  ).
+
+(* Controller process *)
+let Controller(IDC: id, QC: skey, KA_C: key) =
+  (* Receive authentication data request *)
+  in(c, (encrypted_m2: bitstring, TSA1: timestamp));
+  
+  (* Verify timestamp freshness *)
+  new currentTime: timestamp;
+  if isFresh(TSA1, currentTime) then
+  (
+    (* Decrypt and verify *)
+    let (IDU_bits: bitstring, IDC_bits: bitstring, PU_bits: bitstring, TSA1_bits: bitstring) = 
+        sdec(encrypted_m2, KA_C) in
+    
+    let IDU = bits2id(IDU_bits) in
+    let IDC_recv = bits2id(IDC_bits) in
+    let PU = bits2pkey(PU_bits) in
+    
+    (* Fixed the parameter to use timestamp2bits to get a bitstring *)
+    event ControllerReceived(IDU, IDC_recv, PU, timestamp2bits(TSA1));
+    
+    if IDC_recv = IDC then
+    (
+      (* Generate ephemeral key pair *)
+      new qC: skey;
+      let PC = pk(qC) in
+      
+      (* Calculate session key *)
+      let SKC_U = bits2key(h(key2bits(ecMult(qC, PU)))) in
+      
+      (* Generate timestamp *)
+      new TSC: timestamp;
+      
+      (* Construct authentication data response *)
+      let m3 = (id2bits(IDU), id2bits(IDC), pkey2bits(PC), timestamp2bits(TSC)) in
+      let encrypted_m3 = senc(m3, KA_C) in
+      
+      (* Send to AAL *)
+      event ControllerSendsResponse(IDU, IDC, PC, TSC);
+      out(c, (encrypted_m3, TSC));
+      
+      event ControllerAuthenticated(IDU, IDC);
+      event SessionKeyEstablished(IDU, IDC, SKC_U);
+      
+      (* Use session key *)
+      out(c, senc(SK_test, SKC_U))
+    )
+    else
+    (
+      event IDVerificationFailed()
+    )
+  )
+  else
+  (
+    event TimestampCheckFailed()
+  ).
+
+(* Main process *)
+process
+  (* Pre-shared keys *)
+  new KA_U: key;
+  new KA_C: key;
+  
+  (* Registration phase - normally this would be secure *)
+  out(regCh, (pk(QA), KA_U));
+  
+  (* Run protocol participants *)
+  (
+    !User(IDU, IDC, QU, KA_U, pk(QA)) |
+    !AALServer(IDU, IDC, QA, KA_U, KA_C) |
+    !Controller(IDC, QC, KA_C)
+  ) |
+  (
+    (* For testing protocol robustness - leak pre-shared keys in a later phase *)
+    phase 1; 
+    out(c, (key2bits(KA_U), key2bits(KA_C)))
+  )
