@@ -23,7 +23,17 @@ free QA: skey [private].      (* AAL server private key *)
 free QU: skey [private].      (* User's private key *)
 free QC: skey [private].      (* Controller's private key *)
 
-(* Debug variables *)
+(* Debug variables for each participant *)
+free debugUser: bitstring [private].
+free debugAAL1: bitstring [private].  (* After first check *)
+free debugAAL2: bitstring [private].  (* After second check *)
+free debugAAL3: bitstring [private].  (* After third check *)
+free debugAAL4: bitstring [private].  (* Final debug point *)
+free debugAAL5: bitstring [private].  (* Final debug point *)
+free debugController1: bitstring [private].
+free debugController2: bitstring [private].
+
+(* Test variables *)
 free SK_test: bitstring [private].
 
 (* Type conversion - uniform bitstring handling *)
@@ -39,6 +49,7 @@ fun nonce2bits(nonce): bitstring [data, typeConverter].
 fun bits2nonce(bitstring): nonce [data, typeConverter].
 fun key2bits(key): bitstring [data, typeConverter].
 fun bits2key(bitstring): key [data, typeConverter].
+type debug.
 
 (* Cryptographic operations *)
 (* Elliptic curve operations *)
@@ -60,7 +71,7 @@ event UserStarted(id, id, pkey).
 event UserSendsRequest(id, id, pkey, timestamp).
 event AALReceived1(id, id, pkey, bitstring).
 event AALSendsRequest(id, id, pkey, timestamp).
-event ControllerReceived(id, id, pkey, bitstring).  (* Fourth parameter is bitstring, not timestamp *)
+event ControllerReceived(id, id, pkey, bitstring).
 event ControllerSendsResponse(id, id, pkey, timestamp).
 event AALReceived2(id, id, pkey, bitstring).
 event AALSendsResponse(id, id, pkey, timestamp).
@@ -75,6 +86,16 @@ event HMACVerificationFailed().
 event TimestampCheckFailed().
 event IDVerificationFailed().
 
+(* Debug queries *)
+query attacker(debugUser).
+query attacker(debugAAL1).
+query attacker(debugAAL2).
+query attacker(debugAAL3).
+query attacker(debugAAL4).
+query attacker(debugAAL5).
+query attacker(debugController1).
+query attacker(debugController2).
+
 (* Security queries *)
 query attacker(QA).
 query attacker(QU).
@@ -82,7 +103,6 @@ query attacker(QC).
 query attacker(IDU).
 query attacker(IDC).
 query attacker(SK_test).
-
 
 (* Protocol correctness queries *)
 query id1: id, id2: id, pk: pkey, ts: timestamp; 
@@ -151,7 +171,8 @@ let User(IDU: id, IDC: id, QU: skey, KA_U: key, PA: pkey) =
       event SessionKeyEstablished(IDU, IDC, SKC_U);
       
       (* Use session key *)
-      out(c, senc(SK_test, SKC_U))
+      out(c, senc(SK_test, SKC_U));
+      out(c, debugUser)
     )
     else
     (
@@ -186,16 +207,25 @@ let AALServer(IDU: id, IDC: id, QA: skey, KA_U: key, KA_C: key) =
   new currentTime: timestamp;
   if isFresh(TSU, currentTime) then
   (
+    (* Output debug info after first check *)
+    out(c, debugAAL1);
+    
     (* Verify HMAC *)
     let expected_mac = hmacfn(KA_U, (IDU_bits, IDC_bits, PU_bits2, TSU_bits)) in
     
     if hmac2bits(expected_mac) = mac_recv then
     (
+      (* Output debug info after second check *)
+      out(c, debugAAL2);
+      
       event AALReceived1(IDU_recv, IDC_recv, PU, timestamp2bits(TSU));
       
       (* Verify IDs *)
       if IDU_recv = IDU && IDC_recv = IDC then
       (
+        (* Output debug info after third check *)
+        out(c, debugAAL3);
+        
         (* Generate timestamp *)
         new TSA1: timestamp;
         
@@ -205,9 +235,6 @@ let AALServer(IDU: id, IDC: id, QA: skey, KA_U: key, KA_C: key) =
         
         (* Send to controller *)
         event AALSendsRequest(IDU, IDC, PU, TSA1);
-        out(c, (test, TSA1));
-        
-        (* Receive authentication data response *)
         out(c, (encrypted_m2, TSA1));
         
         (* Receive authentication data response *)
@@ -217,6 +244,9 @@ let AALServer(IDU: id, IDC: id, QA: skey, KA_U: key, KA_C: key) =
         new currentTime2: timestamp;
         if isFresh(TSC, currentTime2) then
         (
+          (* Output debug info after fourth check *)
+          out(c, debugAAL4);
+          
           (* Decrypt and verify *)
           let (IDU_bits2: bitstring, IDC_bits2: bitstring, PC_bits: bitstring, TSC_bits: bitstring) = 
               sdec(encrypted_m3, KA_C) in
@@ -229,6 +259,9 @@ let AALServer(IDU: id, IDC: id, QA: skey, KA_U: key, KA_C: key) =
           
           if IDU_recv2 = IDU && IDC_recv2 = IDC then
           (
+            (* Output debug info after fifth check *)
+            out(c, debugAAL5);
+            
             (* Generate timestamp *)
             new TSA2: timestamp;
             
@@ -239,7 +272,6 @@ let AALServer(IDU: id, IDC: id, QA: skey, KA_U: key, KA_C: key) =
             (* Send to user *)
             event AALSendsResponse(IDU, IDC, PC, TSA2);
             out(c, (encrypted_m4, TSA2));
-            out(c,(test1));
             event AALAuthenticated(IDU, IDC)
           )
           else
@@ -276,6 +308,9 @@ let Controller(IDC: id, QC: skey, KA_C: key) =
   new currentTime: timestamp;
   if isFresh(TSA1, currentTime) then
   (
+    (* Debug output after first check *)
+    out(c, debugController1);
+    
     (* Decrypt and verify *)
     let (IDU_bits: bitstring, IDC_bits: bitstring, PU_bits: bitstring, TSA1_bits: bitstring) = 
         sdec(encrypted_m2, KA_C) in
@@ -284,11 +319,13 @@ let Controller(IDC: id, QC: skey, KA_C: key) =
     let IDC_recv = bits2id(IDC_bits) in
     let PU = bits2pkey(PU_bits) in
     
-    (* Fixed the parameter to use timestamp2bits to get a bitstring *)
     event ControllerReceived(IDU, IDC_recv, PU, timestamp2bits(TSA1));
     
     if IDC_recv = IDC then
     (
+      (* Debug output after second check *)
+      out(c, debugController2);
+      
       (* Generate ephemeral key pair *)
       new qC: skey;
       let PC = pk(qC) in
