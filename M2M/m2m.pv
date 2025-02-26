@@ -1,0 +1,134 @@
+(* Type declarations *)
+set ignoreTypes = false.
+
+type pubKey.
+type secKey.
+type sharedKey.
+type certificate.
+type nonce.
+type receipt.
+type key.
+type label.
+
+free sch: channel[private]. (*PSK TLS and TLS*)
+free pch: channel.
+
+free pk_CI: pubKey.
+
+table srDB(bitstring, certificate). (*eid, CERT.ECASD*)
+
+(*utils*)
+fun pk(secKey): pubKey.
+fun k2b(key):           bitstring[data, typeConverter].
+fun pk2b(pubKey):      bitstring[data, typeConverter].
+fun sk2b(secKey):      bitstring[data, typeConverter].
+fun b2k(bitstring):     key[data, typeConverter].
+fun l2b(label):        bitstring[data, typeConverter].
+fun c2b(certificate):  bitstring[data, typeConverter].
+
+(* Encryption/Decryption *)
+fun senc(bitstring, key): bitstring.
+reduc forall m: bitstring, n: key;
+sdec(senc(m, n), n) = m.
+
+(* DH key-exchange *)
+fun DHkey(secKey, pubKey): key.
+equation forall sk1: secKey, sk2: secKey;
+DHkey(sk2, pk(sk1)) = DHkey(sk1, pk(sk2)).
+
+(* Digital Signature *)
+fun sign(bitstring, pubKey): bitstring.
+
+reduc forall m:bitstring, pk:pubKey; getmess(sign(m, pk)) = m.
+reduc forall m:bitstring, pk:pubKey; checksign(sign(m, pk), pk) = m.
+
+(* a Key Derivation function *)
+fun KDF(bitstring): key.
+fun extractPK(certificate): pubKey.
+fun generate_random_challenge(bitstring): bitstring.
+
+letfun verify(certificate: certificate)=
+  true.
+
+const ClientHello, ServerHello, ClientKeyExchange, ServerKeyExchange, Finished: label.
+
+(* Events: eUICC registration at SM-SR *)
+event beginSM_SR_eUICC_Registration(bitstring, certificate). (*eid, CERT.ECASD*)
+event check_EIS(bitstring, certificate). (*eid, CERT.ECASD*)
+event endSM_SR_eUICC_Registration(bitstring, certificate). (*EIS is stored in the SM-SR*)
+
+query eid: bitstring, CERT_ECASD: certificate;
+inj-event(endSM_SR_eUICC_Registration(eid, CERT_ECASD))
+==> inj-event(beginSM_SR_eUICC_Registration(eid, CERT_ECASD)).
+
+let EUICC(eid: bitstring, iccid: bitstring, CERT_ECASD: certificate)=
+  in(sch, (CERT_DP: certificate));
+  if checksign(c2b(CERT_DP), pk_CI) = c2b(CERT_DP) then
+  (
+    let pk_DP = extractPK(CERT_DP) in
+    let challenge = generate_random_challenge(pk2b(pk_DP)) in
+    out(sch, (challenge)) 
+  ).
+(* ================ EUM ================ *)
+
+let EUM(eid: bitstring) =
+  new CERT_ECASD: certificate;
+  event beginSM_SR_eUICC_Registration(eid, CERT_ECASD); (*Calling registerEIS function*)
+  out(sch, (eid, CERT_ECASD)).
+
+(* ================ SM-SR ================ *)
+
+let SM_SR(CERT_SR: certificate) =
+  new dh_pubKey_SR: pubKey;
+  new dh_secKey_SR: secKey;
+  in(sch, (eid: bitstring, CERT_ECASD: certificate));
+  get srDB(=eid, hCERT_ECASD) in (*Retrieve EIS from SM-SR STORAGE*)
+  if CERT_ECASD <> hCERT_ECASD then (*Checking that no same*)
+  (
+    event check_EIS(eid, CERT_ECASD); (*Checking if the EIS is stored in the SM-SR*)
+    insert srDB(eid, CERT_ECASD);
+    event endSM_SR_eUICC_Registration(eid, CERT_ECASD) (*EIS is stored in the SM-SR*)
+
+    (* Start Key Establishment with the eUICC and SM-DP *)
+
+
+    
+  ).
+
+(* ================ OPERATOR ================ *)
+  
+let OPERATOR(eid: bitstring, srid: bitstring, iccid: bitstring) =
+  (* Profile download request (eid, srid, iccid) *)
+  out(pch, (eid, srid, iccid)).
+
+(* ================ SM-DP ================ *)
+
+
+let SM_DP(dpid: bitstring)=
+  new dh_pubKey_DP: pubKey;
+  new dh_secKey_DP: secKey;
+  (* Get profile download request data *)
+  in(pch, (eid: bitstring, srid: bitstring, iccid: bitstring));
+  let CERT_DP = sign(dpid, pk_CI) in
+  out(sch, (CERT_DP)).
+
+
+
+(* ================ MAIN PROCESS ================ *)
+
+
+process
+  new eid: bitstring; (* eUICC ID *)
+  new srid: bitstring; (* SM-SR ID *)
+  new iccid: bitstring; (* ICCID *)
+  new dpid: bitstring; (* DPID *)
+
+  (* CI Issued Certificates *)
+  new CERT_SR: certificate;
+  new CERT_ECASD: certificate;
+
+  (!EUM(eid)) |
+  (!SM_SR(CERT_SR)) |
+  (!OPERATOR(eid, srid, iccid)) |
+  (!SM_DP(dpid)) |
+  (!EUICC(eid, iccid, CERT_ECASD))
